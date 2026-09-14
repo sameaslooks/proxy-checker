@@ -5,6 +5,10 @@ Checks HTTP/HTTPS/SOCKS4/SOCKS5 proxies in parallel, detects anonymity,
 performs geo lookup, measures throughput, and exposes results via HTTP
 for other applications (MegaBasterd, browsers via PAC, scripts).
 
+Also includes a built-in local SOCKS5 facade that can rotate upstream
+proxies from the live pool — so any client (Telegram, browser, curl)
+can use a single SOCKS5 endpoint with automatic rotation.
+
 Author: https://github.com/sameaslooks
 License: GPLv3
 """
@@ -17,8 +21,10 @@ import os
 import queue
 import random
 import re
+import struct
 import threading
 import time
+import collections
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from tkinter import (
@@ -48,10 +54,10 @@ IP_PORT_RE = re.compile(
 )
 
 CONFIG_FILE = "proxy_checker_config.yaml"
+FACADE_STATE_FILE = "facade_state.json"
 MAX_ROWS = 5000
 FLUSH_MS = 200
 
-# Browser-like User-Agent so sites don't reject us with 403
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -63,6 +69,21 @@ PROXY_HEADERS = {
     "x-real-ip", "proxy-connection", "x-proxy-id",
     "x-forwarded-host", "x-forwarded-proto", "forwarded-for",
 }
+
+# SOCKS5 protocol constants (for the local facade)
+SOCKS_VERSION = 0x05
+SOCKS_CMD_CONNECT = 0x01
+SOCKS_ATYP_IPV4 = 0x01
+SOCKS_ATYP_DOMAIN = 0x03
+SOCKS_ATYP_IPV6 = 0x04
+SOCKS_REP_SUCCESS = 0x00
+SOCKS_REP_GENERAL_FAIL = 0x01
+SOCKS_REP_HOST_UNREACH = 0x04
+SOCKS_REP_CMD_UNSUPPORTED = 0x07
+SOCKS_AUTH_NONE = 0x00
+SOCKS_AUTH_USERPASS = 0x02
+SOCKS_AUTH_REP_SUCCESS = 0x00
+SOCKS_AUTH_REP_FAILURE = 0x01
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +135,7 @@ TRANSLATIONS = {
         "ready": "Ready",
         "stopped": "stopped",
         "auto_off": "off",
+        "autostart_check": "Run check on startup (if sources present)",
         "no_sources": "Add at least one source",
         "no_results": "No results",
         "check_running": "Check already running",
@@ -139,6 +161,8 @@ TRANSLATIONS = {
         "log_cfg_loaded": "[*] Config loaded",
         "log_export": "[+] Exported: {path}",
         "log_swap": "[*] Snapshot swapped: {n} proxies now live",
+        "log_autostart_empty": "[*] Autostart: no previous snapshot, running check...",
+        "log_autostart_old": "[*] Autostart: loaded {n} from previous run, running check anyway...",
         "tray_show": "Show window",
         "tray_hide": "Hide window (tray)",
         "tray_run": "Run check now",
@@ -147,6 +171,28 @@ TRANSLATIONS = {
         "auto_status": "every {n} min",
         "state_old": "serving: previous run ({n})",
         "state_new": "serving: current run ({n})",
+        # Facade
+        "facade_group": "Local SOCKS5 facade (rotate upstream from pool)",
+        "facade_host": "Host:",
+        "facade_port": "Port:",
+        "facade_rotation": "Rotate upstream",
+        "facade_rotation_interval": "Interval (s):",
+        "facade_cooldown": "Cooldown (s):",
+        "facade_start": "Start facade",
+        "facade_stop": "Stop facade",
+        "facade_running": "Facade: running on {host}:{port}",
+        "facade_stopped": "Facade: stopped",
+        "facade_pool": "Pool for facade: {n}",
+        "facade_log_start": "[*] Facade starting...",
+        "facade_log_listen": "[+] Facade listening on {host}:{port}",
+        "facade_log_stop": "[*] Facade stopped",
+        "facade_log_connect": "[+] Facade: {client} → {target} via {upstream}",
+        "facade_log_all_failed": "[!] Facade: all upstreams failed for {target}",
+        "facade_no_upstream": "[!] Facade: no upstream — DIRECT",
+        "facade_err": "[!] Facade error: {err}",
+        "facade_auth_user": "SOCKS5 username:",
+        "facade_auth_pass": "SOCKS5 password:",
+        "facade_auth_hint": "(leave empty for no-auth)",
     },
     "ru": {
         "title": "Proxy Checker",
@@ -192,6 +238,7 @@ TRANSLATIONS = {
         "ready": "Готов",
         "stopped": "остановлен",
         "auto_off": "выкл",
+        "autostart_check": "Автопрогон при старте (если есть источники)",
         "no_sources": "Добавьте хотя бы один источник",
         "no_results": "Нет результатов",
         "check_running": "Проверка уже идёт",
@@ -217,6 +264,8 @@ TRANSLATIONS = {
         "log_cfg_loaded": "[*] Конфиг загружен",
         "log_export": "[+] Экспорт: {path}",
         "log_swap": "[*] Снимок переключён: {n} прокси активны",
+        "log_autostart_empty": "[*] Автостарт: нет снапшота, запускаю проверку...",
+        "log_autostart_old": "[*] Автостарт: {n} из прошлого прогона, всё равно запускаю проверку...",
         "tray_show": "Показать окно",
         "tray_hide": "Скрыть окно (трей)",
         "tray_run": "Запустить проверку сейчас",
@@ -225,6 +274,28 @@ TRANSLATIONS = {
         "auto_status": "каждые {n} мин",
         "state_old": "отдаётся: прошлый прогон ({n})",
         "state_new": "отдаётся: текущий прогон ({n})",
+        # Facade
+        "facade_group": "Локальный SOCKS5-фасад (ротация upstream из пула)",
+        "facade_host": "Хост:",
+        "facade_port": "Порт:",
+        "facade_rotation": "Ротировать upstream",
+        "facade_rotation_interval": "Интервал (с):",
+        "facade_cooldown": "Cooldown (с):",
+        "facade_start": "Запустить фасад",
+        "facade_stop": "Остановить фасад",
+        "facade_running": "Фасад: работает на {host}:{port}",
+        "facade_stopped": "Фасад: остановлен",
+        "facade_pool": "Пул для фасада: {n}",
+        "facade_log_start": "[*] Запуск фасада...",
+        "facade_log_listen": "[+] Фасад слушает {host}:{port}",
+        "facade_log_stop": "[*] Фасад остановлен",
+        "facade_log_connect": "[+] Фасад: {client} → {target} через {upstream}",
+        "facade_log_all_failed": "[!] Фасад: все upstream упали для {target}",
+        "facade_no_upstream": "[!] Фасад: нет upstream — DIRECT",
+        "facade_err": "[!] Ошибка фасада: {err}",
+        "facade_auth_user": "SOCKS5 логин:",
+        "facade_auth_pass": "SOCKS5 пароль:",
+        "facade_auth_hint": "(пусто — без аутентификации)",
     },
 }
 
@@ -232,7 +303,6 @@ CURRENT_LANG = "en"
 
 
 def detect_language():
-    """Pick default language from config or system locale."""
     try:
         sys_lang = (locale.getdefaultlocale()[0] or "en").lower()
     except Exception:
@@ -273,7 +343,6 @@ class ProxyResult:
 # ---------------------------------------------------------------------------
 
 def parse_proxies(text: str):
-    """Extract (scheme, ip, port) from plain text — fallback parser."""
     seen = set()
     for m in IP_PORT_RE.finditer(text):
         scheme = (m.group("scheme") or "http").lower()
@@ -289,11 +358,6 @@ def parse_proxies(text: str):
 
 
 def _walk_json_for_proxies(node):
-    """Recursively find dicts with ip+port, or strings containing ip:port.
-
-    Only addresses are extracted. Metadata (country, anonymity, speed)
-    from external sources is IGNORED — we always re-verify ourselves.
-    """
     if isinstance(node, dict):
         ip = node.get("ip") or node.get("addr") or node.get("host")
         port = node.get("port")
@@ -323,64 +387,42 @@ def _walk_json_for_proxies(node):
 
 
 def _extract_from_html_rows(html_text):
-    """Parse HTML tables where IP and port are in adjacent <td> cells.
-
-    Works for free-proxy-list.net, hidemy.name, spys.one, etc.
-    Only addresses are extracted; metadata is re-checked by us.
-    """
     ip_re = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})$")
     port_re = re.compile(r"^(\d{1,5})$")
     proto_re = re.compile(r"\b(HTTP|HTTPS|SOCKS4|SOCKS5)\b", re.IGNORECASE)
 
-    for tr in re.findall(r"<tr\b[^>]*>(.*?)</tr>", html_text,
-                         flags=re.IGNORECASE | re.DOTALL):
-        cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", tr,
+    for tr_row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", html_text,
+                             flags=re.IGNORECASE | re.DOTALL):
+        cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", tr_row,
                            flags=re.IGNORECASE | re.DOTALL)
         if len(cells) < 2:
             continue
-
         cleaned = []
         for c in cells:
             c = re.sub(r"<[^>]+>", " ", c)
             c = _html.unescape(c)
             c = re.sub(r"\s+", " ", c).strip()
             cleaned.append(c)
-
         m_ip = ip_re.match(cleaned[0])
         m_port = port_re.match(cleaned[1])
         if not (m_ip and m_port):
             continue
-
         ip = m_ip.group(1)
         port = int(m_port.group(1))
         if not (0 < port < 65536):
             continue
-
         scheme = "http"
         row_text = " ".join(cleaned[2:])
         pm = proto_re.search(row_text)
         if pm:
             scheme = pm.group(1).lower()
-            # "HTTPS" -> "https"; "SOCKS4" -> "socks4"; "SOCKS5" -> "socks5"
-            # "HTTP" -> "http". All lowercase already by .lower().
         yield scheme, ip, port
 
 
 def extract_proxies_from_any(text: str):
-    """Extract (scheme, ip, port) from plain text, JSON, or HTML.
-
-    Order:
-      1. HTML tables (must run before tag stripping)
-      2. JSON (if the text looks like JSON)
-      3. Plain text after stripping tags
-
-    Metadata from external sources is IGNORED — we always re-verify.
-    Deduplicates within the call.
-    """
     seen = set()
     stripped = text.strip()
 
-    # 1. HTML table rows
     lower = text.lower()
     if "<tr" in lower and "<td" in lower:
         for scheme, ip, port in _extract_from_html_rows(text):
@@ -389,7 +431,6 @@ def extract_proxies_from_any(text: str):
                 seen.add(key)
                 yield scheme, ip, port
 
-    # 2. JSON
     if stripped.startswith("{") or stripped.startswith("["):
         try:
             data = json.loads(stripped)
@@ -401,7 +442,6 @@ def extract_proxies_from_any(text: str):
         except Exception:
             pass
 
-    # 3. Plain text after stripping script/style and all tags
     cleaned = re.sub(r"<script\b[^>]*>.*?</script>", " ", text,
                      flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"<style\b[^>]*>.*?</style>", " ", cleaned,
@@ -500,7 +540,7 @@ async def get_my_ip(session, log):
                     return ip
         except Exception as e:
             log(f"[!] Failed to get my IP via {url}: {e}")
-    log("[!] Could not determine my IP — transparent won't be distinguished from anonymous")
+    log("[!] Could not determine my IP")
     return ""
 
 
@@ -521,7 +561,6 @@ async def geo_lookup(session, ip):
 
 
 async def detect_anonymity(session_plain, scheme, ip, port, headers_url, my_ip, timeout):
-    # SOCKS4/5 do not add HTTP headers — from the site's perspective, it's direct
     if scheme in ("socks4", "socks5"):
         return "elite"
     try:
@@ -590,7 +629,6 @@ async def check_one(session_plain, scheme, ip, port, check_url, timeout, source)
 
 
 async def measure_speed(session_plain, scheme, ip, port, test_url, timeout, size_bytes):
-    """Download up to size_bytes through the proxy and return KB/s."""
     received = 0
     start = time.perf_counter()
     try:
@@ -701,7 +739,6 @@ async def check_many(proxies, cfg, log, progress_cb, on_result, stop_event, on_s
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Second pass: speed test
         if do_speed and ok_results and not stop_event.is_set():
             log(tr("log_speed_start",
                    n=len(ok_results),
@@ -739,12 +776,6 @@ def make_http_app(app: "App") -> aioweb.Application:
     routes = aioweb.RouteTableDef()
 
     def _current_data():
-        """Return the data that endpoints should serve right now.
-
-        - While a check is running: previous snapshot (proxies_old)
-        - After a check completes: the result of the last check (proxies_old,
-          which was swapped from proxies_new at the end)
-        """
         with app.proxies_lock:
             return list(app.proxies_old)
 
@@ -788,7 +819,7 @@ def make_http_app(app: "App") -> aioweb.Application:
             data.sort(key=lambda r: r.latency_ms or 10**9)
         elif sort_by == "random":
             random.shuffle(data)
-        else:  # "speed" — default
+        else:
             data.sort(key=lambda r: r.speed_kbps or 0, reverse=True)
 
         if limit > 0:
@@ -840,7 +871,6 @@ def make_http_app(app: "App") -> aioweb.Application:
 
     @routes.get("/best")
     async def best(req):
-        # Top-N by download speed (alias for /proxies with default sort)
         data = _filter(req, force_sort="speed")
         body = "\n".join(f"{r.protocol}://{r.ip}:{r.port}" for r in data)
         return aioweb.Response(text=body, content_type="text/plain")
@@ -866,7 +896,6 @@ def make_http_app(app: "App") -> aioweb.Application:
 
     @routes.get("/pac")
     async def pac(req):
-        # For browsers: sort by download speed, chain top-3 with DIRECT fallback
         data = _filter(req, force_sort="speed")
         if not data:
             pac_text = "function FindProxyForURL(url, host) { return 'DIRECT'; }"
@@ -893,6 +922,626 @@ def make_http_app(app: "App") -> aioweb.Application:
 
 
 # ---------------------------------------------------------------------------
+# SOCKS5 facade (in-process, reads from app.proxies_old)
+# ---------------------------------------------------------------------------
+
+class _UpstreamDead(Exception):
+    """Raised when the upstream proxy itself is unreachable.
+
+    TCP connect failed, SOCKS5 handshake failed, or the proxy closed
+    the connection before completing the CONNECT request. The proxy
+    is considered dead and should go on cooldown.
+    """
+
+
+class _UpstreamRejected(Exception):
+    """Raised when the upstream proxy is alive but rejected the request.
+
+    Examples: SOCKS5 reply != 0x00, HTTP CONNECT returned non-200.
+    The proxy is alive — it's the target that it won't serve. Do NOT
+    put it on global cooldown; just skip it for this session.
+    """
+
+class FacadeUpstream:
+    __slots__ = ("raw", "protocol", "ip", "port")
+
+    def __init__(self, raw, protocol, ip, port):
+        self.raw = raw
+        self.protocol = protocol
+        self.ip = ip
+        self.port = port
+
+
+async def _read_exact(reader, n):
+    return await reader.readexactly(n)
+
+
+async def _socks5_client_handshake(reader, writer, req_user="", req_pass=""):
+    """Read SOCKS5 client greeting and negotiate auth method.
+
+    If `req_user` is non-empty, require username/password auth (RFC 1929).
+    Otherwise accept no-auth.
+    Returns True on successful negotiation, False otherwise.
+    """
+    ver_nmethods = await _read_exact(reader, 2)
+    ver, nmethods = ver_nmethods[0], ver_nmethods[1]
+    if ver != SOCKS_VERSION:
+        return False
+    methods = set(await _read_exact(reader, nmethods))
+
+    require_auth = bool(req_user)
+
+    if require_auth:
+        if SOCKS_AUTH_USERPASS not in methods:
+            # Client does not support user/pass — reject.
+            writer.write(bytes([SOCKS_VERSION, 0xFF]))
+            await writer.drain()
+            return False
+        writer.write(bytes([SOCKS_VERSION, SOCKS_AUTH_USERPASS]))
+        await writer.drain()
+        # Read auth sub-negotiation: VER | ULEN | UNAME | PLEN | PASSWD
+        head = await _read_exact(reader, 2)
+        if head[0] != 0x01:
+            writer.write(bytes([0x01, SOCKS_AUTH_REP_FAILURE]))
+            await writer.drain()
+            return False
+        ulen = head[1]
+        uname = (await _read_exact(reader, ulen)).decode("utf-8", errors="ignore")
+        plen = (await _read_exact(reader, 1))[0]
+        passwd = (await _read_exact(reader, plen)).decode("utf-8", errors="ignore")
+        if uname == req_user and passwd == req_pass:
+            writer.write(bytes([0x01, SOCKS_AUTH_REP_SUCCESS]))
+            await writer.drain()
+            return True
+        writer.write(bytes([0x01, SOCKS_AUTH_REP_FAILURE]))
+        await writer.drain()
+        return False
+    else:
+        if SOCKS_AUTH_NONE not in methods:
+            writer.write(bytes([SOCKS_VERSION, 0xFF]))
+            await writer.drain()
+            return False
+        writer.write(bytes([SOCKS_VERSION, SOCKS_AUTH_NONE]))
+        await writer.drain()
+        return True
+
+
+async def _socks5_client_request(reader):
+    """Read SOCKS5 CONNECT request, return (host, port) or None."""
+    header = await _read_exact(reader, 4)
+    ver, cmd, rsv, atyp = header
+    if ver != SOCKS_VERSION or cmd != SOCKS_CMD_CONNECT:
+        return None
+    if atyp == SOCKS_ATYP_IPV4:
+        raw = await _read_exact(reader, 4)
+        host = ".".join(str(b) for b in raw)
+    elif atyp == SOCKS_ATYP_DOMAIN:
+        ln = (await _read_exact(reader, 1))[0]
+        raw = await _read_exact(reader, ln)
+        host = raw.decode("idna", errors="ignore")
+    elif atyp == SOCKS_ATYP_IPV6:
+        raw = await _read_exact(reader, 16)
+        host = ":".join(f"{raw[i]:02x}{raw[i+1]:02x}" for i in range(0, 16, 2))
+    else:
+        return None
+    port = struct.unpack("!H", await _read_exact(reader, 2))[0]
+    return host, port
+
+
+def _socks5_reply(rep, bind_ip="0.0.0.0", bind_port=0):
+    """Build a SOCKS5 reply packet."""
+    return bytes([SOCKS_VERSION, rep, 0x00, SOCKS_ATYP_IPV4]) + \
+           bytes(int(x) for x in bind_ip.split(".")) + \
+           struct.pack("!H", bind_port)
+
+
+async def _pipe(reader, writer):
+    """One-directional byte pump. Closes both on EOF or error."""
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def _upstream_connect(up: FacadeUpstream, host, port):
+    """Open TCP to (host, port) through the given upstream proxy.
+
+    Raises:
+      * _UpstreamDead      — proxy itself is dead.
+      * _UpstreamRejected  — proxy refused CONNECT to this target.
+    """
+    if up.protocol == "socks5":
+        return await _upstream_socks5(up, host, port)
+    if up.protocol == "socks4":
+        return await _upstream_socks4(up, host, port)
+    return await _upstream_http_connect(up, host, port)
+
+
+async def _upstream_socks5(up, host, port):
+    """Dial SOCKS5 upstream and CONNECT to target."""
+    try:
+        reader, writer = await asyncio.open_connection(up.ip, up.port)
+    except Exception as e:
+        raise _UpstreamDead(f"tcp connect: {e}")
+    try:
+        writer.write(b"\x05\x01\x00")
+        await writer.drain()
+        if await reader.readexactly(2) != b"\x05\x00":
+            raise _UpstreamDead("socks5 handshake: auth rejected")
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
+            atyp = SOCKS_ATYP_IPV4
+            addr = bytes(int(x) for x in host.split("."))
+        else:
+            hb = host.encode("idna")
+            atyp = SOCKS_ATYP_DOMAIN
+            addr = bytes([len(hb)]) + hb
+        writer.write(bytes([SOCKS_VERSION, SOCKS_CMD_CONNECT, 0, atyp]) +
+                     addr + struct.pack("!H", port))
+        await writer.drain()
+        head = await reader.readexactly(4)
+        if head[1] != 0:
+            # Proxy is alive, it just refused CONNECT to this target.
+            raise _UpstreamRejected(f"socks5 rep={head[1]}")
+        at = head[3]
+        if at == SOCKS_ATYP_IPV4:
+            await reader.readexactly(6)
+        elif at == SOCKS_ATYP_DOMAIN:
+            ln = (await reader.readexactly(1))[0]
+            await reader.readexactly(ln + 2)
+        elif at == SOCKS_ATYP_IPV6:
+            await reader.readexactly(18)
+    except (_UpstreamDead, _UpstreamRejected):
+        try:
+            writer.close()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        raise _UpstreamDead(f"socks5 io: {e}")
+    return reader, writer
+
+
+async def _upstream_socks4(up, host, port):
+    """Dial SOCKS4 upstream and CONNECT to target."""
+    import socket as _s
+    try:
+        reader, writer = await asyncio.open_connection(up.ip, up.port)
+    except Exception as e:
+        raise _UpstreamDead(f"tcp connect: {e}")
+    try:
+        ip = _s.gethostbyname(host)
+        writer.write(b"\x04\x01" + struct.pack("!H", port) +
+                     bytes(int(x) for x in ip.split(".")) + b"\x00")
+        await writer.drain()
+        resp = await reader.readexactly(8)
+        if resp[1] != 0x5A:
+            raise _UpstreamRejected(f"socks4 rep={resp[1]}")
+    except (_UpstreamDead, _UpstreamRejected):
+        try:
+            writer.close()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        raise _UpstreamDead(f"socks4 io: {e}")
+    return reader, writer
+
+
+async def _upstream_http_connect(up, host, port):
+    """Dial HTTP proxy and issue CONNECT to target."""
+    try:
+        reader, writer = await asyncio.open_connection(up.ip, up.port)
+    except Exception as e:
+        raise _UpstreamDead(f"tcp connect: {e}")
+    try:
+        req = (f"CONNECT {host}:{port} HTTP/1.1\r\n"
+               f"Host: {host}:{port}\r\n\r\n").encode()
+        writer.write(req)
+        await writer.drain()
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = await reader.read(1024)
+            if not chunk:
+                # Proxy closed the connection mid-CONNECT — treat as dead.
+                raise _UpstreamDead("http proxy closed in CONNECT")
+            buf += chunk
+        if b" 200 " not in buf.split(b"\r\n", 1)[0]:
+            # Proxy is alive, just refused CONNECT to this target.
+            raise _UpstreamRejected("http CONNECT rejected")
+    except (_UpstreamDead, _UpstreamRejected):
+        try:
+            writer.close()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        raise _UpstreamDead(f"http io: {e}")
+    return reader, writer
+
+
+class Socks5Facade:
+    """Local SOCKS5 server that rotates upstream proxies from app.proxies_old.
+
+    On any upstream failure (TCP refused, CONNECT rejected, timeout) the
+    proxy is skipped and the next one is tried. Failed proxies go on a
+    short cooldown so they are not immediately reused.
+    """
+
+    def __init__(self, app: "App", host, port, log):
+        self.app = app
+        self.host = host
+        self.port = port
+        self.log = log
+        self.server = None
+        self._cooldowns = {}          # raw -> unix time until available again
+        self._active_upstream = None  # currently used upstream
+        self._active_since = 0.0      # unix time when active became active
+        self.running = False
+        self._state_dirty = False
+        self._load_state()
+
+    def _load_state(self):
+        """Load cooldowns and active upstream from facade_state.json."""
+        if not os.path.exists(FACADE_STATE_FILE):
+            return
+        try:
+            with open(FACADE_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        now = time.time()
+        # Restore cooldowns (only ones that haven't expired yet).
+        cd = data.get("cooldowns") or {}
+        for raw, until in cd.items():
+            try:
+                until_f = float(until)
+            except (TypeError, ValueError):
+                continue
+            if until_f > now:
+                self._cooldowns[raw] = until_f
+        # Restore active upstream (if still in cooldown-free state).
+        active_raw = data.get("active_raw")
+        active_since = data.get("active_since") or 0.0
+        if active_raw and active_raw not in self._cooldowns:
+            # We do not know protocol/ip/port yet — parse from raw.
+            m = re.match(r"^(socks5|socks4|https?|http)://([\d.]+):(\d+)$",
+                         active_raw)
+            if m:
+                self._active_upstream = FacadeUpstream(
+                    raw=active_raw,
+                    protocol=m.group(1),
+                    ip=m.group(2),
+                    port=int(m.group(3)),
+                )
+                try:
+                    self._active_since = float(active_since)
+                except (TypeError, ValueError):
+                    self._active_since = now
+        n_cd = sum(1 for u in self._cooldowns.values() if u > now)
+        if self._active_upstream:
+            self.log(f"[*] Facade state restored: active={self._active_upstream.raw} "
+                     f"cooldowns={n_cd}")
+
+    def _save_state(self):
+        """Atomically save cooldowns and active upstream to facade_state.json."""
+        now = time.time()
+        data = {
+            "active_raw": self._active_upstream.raw if self._active_upstream else None,
+            "active_since": self._active_since,
+            "cooldowns": {raw: until for raw, until in self._cooldowns.items()
+                          if until > now},
+        }
+        tmp = FACADE_STATE_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, FACADE_STATE_FILE)
+        except Exception:
+            pass
+
+    async def _pick(self, exclude=None):
+        """Return the upstream to use for a new session.
+
+        Rules:
+          * One active upstream serves ALL sessions until rotation fires.
+          * Rotation fires every `facade_interval` seconds.
+          * On rotation, pick the fastest available upstream (top-1). If
+            top-1 is in cooldown or excluded, fall through to top-2, etc.
+          * Rotation disabled: stay on top-1 forever (until it fails).
+          * On failure, the active upstream goes to cooldown and is dropped;
+            the next call picks the next available.
+        """
+        now = time.time()
+        exclude = exclude or set()
+        rotation_enabled = bool(self.app.facade_rotation.get())
+        interval = max(1, int(self.app.facade_interval.get()))
+
+        # Active still usable?
+        if self._active_upstream is not None \
+                and self._active_upstream.raw not in exclude \
+                and self._cooldowns.get(self._active_upstream.raw, 0) <= now:
+            if not rotation_enabled:
+                return self._active_upstream
+            if (now - self._active_since) < interval:
+                return self._active_upstream
+
+        # Pick the fastest available.
+        with self.app.proxies_lock:
+            data = list(self.app.proxies_old)
+        if not data:
+            self._active_upstream = None
+            self._save_state()
+            return None
+        data.sort(key=lambda r: r.speed_kbps or 0, reverse=True)
+
+        chosen = None
+        for r in data:
+            raw = f"{r.protocol}://{r.ip}:{r.port}"
+            if raw in exclude:
+                continue
+            if self._cooldowns.get(raw, 0) > now:
+                continue
+            chosen = FacadeUpstream(raw=raw, protocol=r.protocol,
+                                    ip=r.ip, port=r.port)
+            break
+
+        if chosen is None:
+            self._active_upstream = None
+            self._save_state()
+            return None
+
+        self._active_upstream = chosen
+        self._active_since = now
+        self._save_state()
+        return chosen
+
+    async def _handle(self, reader, writer):
+        """Handle one client SOCKS5 session."""
+        peer = writer.get_extra_info("peername")
+        client = f"{peer[0]}:{peer[1]}" if peer else "?"
+        try:
+            auth_user = (self.app.facade_auth_user.get() or "").strip()
+            auth_pass = self.app.facade_auth_pass.get() or ""
+            try:
+                ok = await _socks5_client_handshake(reader, writer,
+                                                    auth_user, auth_pass)
+            except asyncio.IncompleteReadError:
+                return  # client closed without completing handshake
+            if not ok:
+                if auth_user:
+                    self.log(f"[!] Facade auth failed from {client}")
+                return
+            if auth_user:
+                self.log(f"[+] Facade auth ok: {client} as '{auth_user}'")
+            req = await _socks5_client_request(reader)
+            if not req:
+                writer.write(_socks5_reply(SOCKS_REP_CMD_UNSUPPORTED))
+                await writer.drain()
+                return
+            host, port = req
+            target = f"{host}:{port}"
+
+            rotation_enabled = bool(self.app.facade_rotation.get())
+            cooldown_sec = int(self.app.facade_cooldown.get())
+            dial_timeout = int(self.app.facade_dial_timeout.get())
+
+            # Try upstreams until one connects, or we run out of options.
+            tried = set()
+            upstream = None
+            ur = uw = None
+            max_attempts = min(10, len(self.app.proxies_old) or 3)
+            for _ in range(max_attempts):
+                if not self.running:
+                    return
+                upstream = await self._pick(exclude=tried)
+                if upstream is None:
+                    break
+                tried.add(upstream.raw)
+                if upstream is None:
+                    break
+                tried.add(upstream.raw)
+                try:
+                    ur, uw = await asyncio.wait_for(
+                        _upstream_connect(upstream, host, port),
+                        timeout=dial_timeout,
+                    )
+                    break
+                except _UpstreamRejected as e:
+                    # Proxy is alive, it just refuses this target.
+                    # Do NOT put it on cooldown — only exclude for this session.
+                    # self.log(f"[!] Facade rejected: {upstream.raw} for {target}: {e}")
+                    upstream = None
+                    ur = uw = None
+                    continue
+                except asyncio.TimeoutError:
+                    # self.log(f"[!] Facade timeout: {upstream.raw} (> {dial_timeout}s)")
+                    self._cooldowns[upstream.raw] = time.time() + cooldown_sec
+                    self._save_state()
+                    upstream = None
+                    ur = uw = None
+                    continue
+                except _UpstreamDead as e:
+                    # self.log(f"[!] Facade dead: {upstream.raw}: {e}")
+                    self._cooldowns[upstream.raw] = time.time() + cooldown_sec
+                    self._save_state()
+                    upstream = None
+                    ur = uw = None
+                    continue
+                except Exception as e:
+                    # Unknown error — log and cooldown to be safe.
+                    # self.log(f"[!] Facade err: {upstream.raw}: "
+                    #          f"{type(e).__name__}: {e}")
+                    self._cooldowns[upstream.raw] = time.time() + cooldown_sec
+                    self._save_state()
+                    upstream = None
+                    ur = uw = None
+                    continue
+
+            if upstream is None or ur is None:
+                self.log(tr("facade_log_all_failed", target=target))
+                try:
+                    writer.write(_socks5_reply(SOCKS_REP_HOST_UNREACH))
+                    await writer.drain()
+                except Exception:
+                    pass
+                return
+
+            # Success reply to client
+            writer.write(_socks5_reply(SOCKS_REP_SUCCESS))
+            await writer.drain()
+            # self.log(tr("facade_log_connect", client=client, target=target,
+            #             upstream=upstream.raw))
+
+            # Pipe both directions; exit when either side closes.
+            t1 = asyncio.create_task(_pipe(reader, uw))
+            t2 = asyncio.create_task(_pipe(ur, writer))
+            try:
+                await asyncio.wait({t1, t2},
+                                   return_when=asyncio.FIRST_COMPLETED)
+            except Exception:
+                pass
+            finally:
+                for t in (t1, t2):
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(t1, t2, return_exceptions=True)
+                for w in (uw, writer):
+                    try:
+                        w.close()
+                    except Exception:
+                        pass
+        except asyncio.IncompleteReadError:
+                return
+        except Exception as e:
+            self.log(tr("facade_err", err=str(e)[:120]))
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def start(self):
+        """Start listening. Returns immediately if already running."""
+        if self.running:
+            return
+        self.running = True
+        try:
+            self.server = await asyncio.start_server(
+                self._handle, self.host, self.port, reuse_address=True
+            )
+        except OSError as e:
+            self.log(tr("facade_err", err=str(e)[:120]))
+            self.running = False
+            self.server = None
+            return
+        self.log(tr("facade_log_listen", host=self.host, port=self.port))
+        try:
+            async with self.server:
+                await self.server.serve_forever()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def stop(self):
+        """Stop listening and wait for the socket to actually close."""
+        self.running = False
+        self._save_state()
+        if self.server:
+            try:
+                self.server.close()
+            except Exception:
+                pass
+            try:
+                await self.server.wait_closed()
+            except Exception:
+                pass
+            self.server = None
+        self.log(tr("facade_log_stop"))
+
+
+class FacadeThread(threading.Thread):
+    """Runs the SOCKS5 facade in its own asyncio loop."""
+
+    def __init__(self, app: "App", log):
+        super().__init__(daemon=True)
+        self.app = app
+        self.log = log
+        self.loop = None
+        self.facade = None
+        self._stop_event = None
+
+    def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._main())
+        except Exception as e:
+            self.log(tr("facade_err", err=str(e)[:120]))
+        finally:
+            try:
+                self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            try:
+                self.loop.close()
+            except Exception:
+                pass
+
+    async def _main(self):
+        self._stop_event = asyncio.Event()
+        self.facade = Socks5Facade(
+            self.app,
+            self.app.facade_host.get(),
+            self.app.facade_port.get(),
+            self.log,
+        )
+        task = asyncio.create_task(self.facade.start())
+        await self._stop_event.wait()
+        # Stop listening first — this closes the socket and interrupts serve_forever.
+        try:
+            await self.facade.stop()
+        except Exception:
+            pass
+        # Then cancel the start task if it's still alive.
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def stop(self):
+        if self.loop and self._stop_event:
+            try:
+                self.loop.call_soon_threadsafe(self._stop_event.set)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
@@ -902,10 +1551,9 @@ class App:
 
         self.root = root
         root.title(tr("title"))
-        root.geometry("1100x960")
+        root.geometry("1100x1000")
 
         self.cfg = load_config()
-        # Language: config > system locale
         CURRENT_LANG = self.cfg.get("language") or detect_language()
 
         self.log_queue = queue.Queue()
@@ -918,9 +1566,6 @@ class App:
         self.total_count = 0
         self.done_count = 0
 
-        # Two independent states:
-        #   proxies_old — what endpoints serve right now (before/while check)
-        #   proxies_new — accumulating during a run; becomes old on finish
         self.proxies_lock = threading.Lock()
         self.proxies_old = []
         self.proxies_new = []
@@ -936,6 +1581,10 @@ class App:
         self.tray_icon = None
         self._auto_job = None
 
+        # Facade state
+        self.facade_thread = None
+        self.facade_running = False
+
         self.auto_enabled = IntVar(value=0)
         self.auto_interval = IntVar(value=30)
         self.hide_on_close = IntVar(value=1)
@@ -948,6 +1597,18 @@ class App:
         self.speed_test_url = StringVar(
             value="https://speed.cloudflare.com/__down?bytes=200000"
         )
+
+        # Facade vars
+        self.facade_host = StringVar(value="127.0.0.1")
+        self.facade_port = IntVar(value=1080)
+        self.facade_rotation = IntVar(value=1)
+        self.facade_interval = IntVar(value=900)
+        self.facade_cooldown = IntVar(value=300)
+        self.facade_dial_timeout = IntVar(value=15)
+        self.facade_autostart = IntVar(value=0)
+        self.autostart_check = IntVar(value=1)
+        self.facade_auth_user = StringVar(value="")
+        self.facade_auth_pass = StringVar(value="")
 
         self.lang_var = StringVar(value=CURRENT_LANG)
 
@@ -967,6 +1628,20 @@ class App:
             self.root.after(500, self._auto_start_http)
         if self.auto_enabled.get():
             self._toggle_auto()
+        if self.facade_autostart.get():
+            self.root.after(800, self.start_facade)
+
+        # Autostart check: if enabled and sources exist, always run a check.
+        # The previous snapshot (if any) stays live in proxies_old so the
+        # facade and HTTP API keep serving while the new check runs.
+        if self.autostart_check.get() and self.src_listbox.size() > 0:
+            with self.proxies_lock:
+                n_old = len(self.proxies_old)
+            if n_old:
+                self._log(tr("log_autostart_old", n=n_old))
+            else:
+                self._log(tr("log_autostart_empty"))
+            self.root.after(1500, self.start)
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -974,7 +1649,7 @@ class App:
         f_src = ttk.LabelFrame(self.root, text=tr("sources"))
         f_src.pack(fill=X, padx=8, pady=4)
 
-        self.src_listbox = Listbox(f_src, height=5)
+        self.src_listbox = Listbox(f_src, height=4)
         self.src_listbox.pack(side=LEFT, fill=BOTH, expand=True, padx=4, pady=4)
         sb = Scrollbar(f_src, command=self.src_listbox.yview)
         sb.pack(side=LEFT, fill=Y)
@@ -1084,13 +1759,42 @@ class App:
             "/fast?min_speed=500&limit=10",
             "/fast?country=DE",
             "/proxies?min_speed=500&sort=speed",
-            "/proxies?country=DE&sort=latency",
-            "/proxies.json?anon=elite",
             "/random?country=FR",
             "/pac?country=DE",
             "/stats",
         ):
             Label(row, text=txt, fg="gray").pack(side=LEFT, padx=4)
+
+        # Facade
+        f_fac = ttk.LabelFrame(self.root, text=tr("facade_group"))
+        f_fac.pack(fill=X, padx=8, pady=4)
+
+        row = Frame(f_fac); row.pack(fill=X, padx=4, pady=2)
+        Label(row, text=tr("facade_host")).pack(side=LEFT)
+        Entry(row, textvariable=self.facade_host, width=12).pack(side=LEFT, padx=4)
+        Label(row, text=tr("facade_port")).pack(side=LEFT, padx=(12, 0))
+        Entry(row, textvariable=self.facade_port, width=6).pack(side=LEFT, padx=4)
+        self.btn_facade = ttk.Button(row, text=tr("facade_start"), command=self.toggle_facade)
+        self.btn_facade.pack(side=LEFT, padx=12)
+        self.facade_status = StringVar(value=tr("facade_stopped"))
+        Label(row, textvariable=self.facade_status).pack(side=LEFT, padx=8)
+        ttk.Checkbutton(row, text=tr("autostart"),
+                        variable=self.facade_autostart).pack(side=LEFT, padx=12)
+
+        row = Frame(f_fac); row.pack(fill=X, padx=4, pady=2)
+        ttk.Checkbutton(row, text=tr("facade_rotation"),
+                        variable=self.facade_rotation).pack(side=LEFT, padx=(0, 12))
+        Label(row, text=tr("facade_rotation_interval")).pack(side=LEFT)
+        Entry(row, textvariable=self.facade_interval, width=6).pack(side=LEFT, padx=4)
+        Label(row, text=tr("facade_cooldown")).pack(side=LEFT, padx=(12, 0))
+        Entry(row, textvariable=self.facade_cooldown, width=6).pack(side=LEFT, padx=4)
+        row = Frame(f_fac); row.pack(fill=X, padx=4, pady=2)
+        Label(row, text=tr("facade_auth_user")).pack(side=LEFT)
+        Entry(row, textvariable=self.facade_auth_user, width=15).pack(side=LEFT, padx=4)
+        Label(row, text=tr("facade_auth_pass")).pack(side=LEFT, padx=(12, 0))
+        Entry(row, textvariable=self.facade_auth_pass, width=15,
+              show="*").pack(side=LEFT, padx=4)
+        Label(row, text=tr("facade_auth_hint"), fg="gray").pack(side=LEFT, padx=8)
 
         # Auto + tray
         f_auto = ttk.LabelFrame(self.root, text=tr("auto_group"))
@@ -1111,6 +1815,10 @@ class App:
                                   values=["en", "ru"], width=5, state="readonly")
         lang_combo.pack(side=LEFT, padx=4)
         lang_combo.bind("<<ComboboxSelected>>", self._on_lang_change)
+
+        row = Frame(f_auto); row.pack(fill=X, padx=4, pady=2)
+        ttk.Checkbutton(row, text=tr("autostart_check"),
+                        variable=self.autostart_check).pack(side=LEFT)
 
         # Buttons
         f_run = Frame(self.root)
@@ -1134,7 +1842,7 @@ class App:
         # Log
         f_log = ttk.LabelFrame(self.root, text="Log")
         f_log.pack(fill=BOTH, expand=True, padx=8, pady=4)
-        self.log = Text(f_log, height=5, wrap="none")
+        self.log = Text(f_log, height=6, wrap="none")
         self.log.pack(side=LEFT, fill=BOTH, expand=True, padx=4, pady=4)
         sb2 = Scrollbar(f_log, command=self.log.yview)
         sb2.pack(side=LEFT, fill=Y)
@@ -1145,7 +1853,7 @@ class App:
         f_res.pack(fill=BOTH, expand=True, padx=8, pady=4)
         cols = ("raw", "protocol", "latency_ms", "speed_kbps", "exit_ip",
                 "country", "city", "isp", "anonymity", "source")
-        self.tree = ttk.Treeview(f_res, columns=cols, show="headings", height=10)
+        self.tree = ttk.Treeview(f_res, columns=cols, show="headings", height=8)
         for c in cols:
             self.tree.heading(c, text=c, command=lambda col=c: self._sort_by_column(col))
             self.tree.column(c, width=100, anchor="w")
@@ -1219,6 +1927,17 @@ class App:
         self.auto_enabled.set(1 if c.get("auto_enabled", False) else 0)
         if "auto_interval" in c: self.auto_interval.set(c["auto_interval"])
         self.hide_on_close.set(1 if c.get("hide_on_close", True) else 0)
+        self.autostart_check.set(1 if c.get("autostart_check", True) else 0)
+        # Facade
+        if "facade_host" in c: self.facade_host.set(c["facade_host"])
+        if "facade_port" in c: self.facade_port.set(c["facade_port"])
+        self.facade_rotation.set(1 if c.get("facade_rotation", True) else 0)
+        if "facade_interval" in c: self.facade_interval.set(c["facade_interval"])
+        if "facade_cooldown" in c: self.facade_cooldown.set(c["facade_cooldown"])
+        if "facade_dial_timeout" in c: self.facade_dial_timeout.set(c["facade_dial_timeout"])
+        self.facade_autostart.set(1 if c.get("facade_autostart", False) else 0)
+        self.facade_auth_user.set(c.get("facade_auth_user", "") or "")
+        self.facade_auth_pass.set(c.get("facade_auth_pass", "") or "")
 
     def load_cfg_into_ui(self):
         self.cfg = load_config()
@@ -1250,6 +1969,7 @@ class App:
             "auto_enabled": bool(self.auto_enabled.get()),
             "auto_interval": int(self.auto_interval.get()),
             "hide_on_close": bool(self.hide_on_close.get()),
+            "autostart_check": bool(self.autostart_check.get()),
             "language": self.lang_var.get(),
             "output": {
                 "dir": self.out_dir.get(),
@@ -1257,6 +1977,16 @@ class App:
                 "by_country_dir": self.out_country.get(),
                 "by_param_dir": self.out_param.get(),
             },
+            # Facade
+            "facade_host": self.facade_host.get(),
+            "facade_port": int(self.facade_port.get()),
+            "facade_rotation": bool(self.facade_rotation.get()),
+            "facade_interval": int(self.facade_interval.get()),
+            "facade_cooldown": int(self.facade_cooldown.get()),
+            "facade_dial_timeout": int(self.facade_dial_timeout.get()),
+            "facade_autostart": bool(self.facade_autostart.get()),
+            "facade_auth_user": self.facade_auth_user.get().strip(),
+            "facade_auth_pass": self.facade_auth_pass.get(),
         }
 
     def choose_dir(self):
@@ -1288,6 +2018,7 @@ class App:
         self.root.after(0, self._update_title)
 
     def _on_speed(self, r: ProxyResult, done: int, total: int):
+        """Update speed cell for a proxy after speed test."""
         def upd():
             key = (r.protocol, r.ip, r.port)
             iid = self._iid_by_key.get(key)
@@ -1301,6 +2032,7 @@ class App:
                         f"({self.done_count})")
 
     def _flush_rows(self):
+        """Batch-insert buffered rows into the tree."""
         if self.row_buffer:
             for r in self.row_buffer:
                 iid = self.tree.insert("", END, values=(
@@ -1387,6 +2119,7 @@ class App:
             self._log(tr("log_http_autostart_fail", err=e))
 
     def start_http_server(self):
+        """Start the HTTP API server in its own thread + event loop."""
         if self.http_server:
             return
         port = int(self.http_port.get())
@@ -1417,7 +2150,6 @@ class App:
             try:
                 loop.run_forever()
             finally:
-                # Cleanup on exit
                 try:
                     loop.run_until_complete(runner.cleanup())
                 except Exception:
@@ -1433,6 +2165,7 @@ class App:
         self.http_server = True
 
     def stop_http_server(self):
+        """Stop the HTTP API server gracefully."""
         if not self.http_server or not self.http_loop:
             return
         loop = self.http_loop
@@ -1447,14 +2180,10 @@ class App:
             fut.result(timeout=5)
         except Exception:
             pass
-
-        # Stop the loop
         try:
             loop.call_soon_threadsafe(loop.stop)
         except Exception:
             pass
-
-        # Wait for the thread to actually finish
         if self.http_thread and self.http_thread.is_alive():
             self.http_thread.join(timeout=3)
 
@@ -1463,6 +2192,50 @@ class App:
         self.http_thread = None
         self.http_loop = None
         self._log(tr("log_http_stop"))
+
+    # ---------- Facade ----------
+    def toggle_facade(self):
+        """Start or stop the local SOCKS5 facade."""
+        if self.facade_running:
+            self.stop_facade()
+        else:
+            self.start_facade()
+
+    def start_facade(self):
+        """Start the facade thread. Safe to call multiple times."""
+        if self.facade_running:
+            return
+        # If a previous thread is somehow still alive, refuse to double-start.
+        if self.facade_thread and self.facade_thread.is_alive():
+            self._log("[*] Facade thread already alive, ignoring start")
+            return
+        self._log(tr("facade_log_start"))
+        self.facade_thread = FacadeThread(self, self._log)
+        self.facade_thread.start()
+        self.facade_running = True
+        self.btn_facade.config(text=tr("facade_stop"))
+        self.facade_status.set(tr("facade_running",
+                                  host=self.facade_host.get(),
+                                  port=self.facade_port.get()))
+
+    def stop_facade(self):
+        """Stop the facade thread and wait for it to actually exit."""
+        if not self.facade_running and not self.facade_thread:
+            return
+        if self.facade_thread:
+            try:
+                self.facade_thread.stop()
+            except Exception:
+                pass
+            # Wait until the thread is really gone — this releases the socket.
+            try:
+                self.facade_thread.join(timeout=5)
+            except Exception:
+                pass
+        self.facade_thread = None
+        self.facade_running = False
+        self.btn_facade.config(text=tr("facade_start"))
+        self.facade_status.set(tr("facade_stopped"))
 
     # ---------- Tray ----------
     def _make_tray_image(self):
@@ -1473,6 +2246,7 @@ class App:
         return img
 
     def _setup_tray(self):
+        """Create and start the system tray icon."""
         menu = Menu(
             Item(tr("tray_show"), self._tray_show, default=True),
             Item(tr("tray_hide"), self._tray_hide),
@@ -1500,9 +2274,14 @@ class App:
         self.root.withdraw()
 
     def _real_quit(self):
+        """Graceful shutdown: stop workers, HTTP server, facade, tray."""
         try:
             if self.worker_thread and self.worker_thread.is_alive():
                 self.stop_event.set()
+        except Exception:
+            pass
+        try:
+            self.stop_facade()
         except Exception:
             pass
         try:
@@ -1515,7 +2294,6 @@ class App:
         except Exception:
             pass
         try:
-            # Force-quit after a short grace period
             self.root.after(200, self.root.destroy)
         except Exception:
             self.root.destroy()
@@ -1551,6 +2329,7 @@ class App:
 
     # ---------- Load old snapshot ----------
     def _load_old_snapshot(self):
+        """Load proxies from previous runs (JSON + by_country files)."""
         base = self.out_dir.get()
         json_path = os.path.join(base, self.out_json.get())
         snapshot = list(load_json_results(json_path))
@@ -1592,6 +2371,7 @@ class App:
 
     # ---------- Run check ----------
     def start(self):
+        """Start a new check run in a worker thread."""
         if self.worker_thread and self.worker_thread.is_alive():
             self._log(tr("check_running"))
             return
@@ -1613,7 +2393,7 @@ class App:
         self.stop_event.clear()
         self._log(tr("log_start"))
 
-        # Start a new run: clear only the new buffer, keep the old snapshot.
+        # Clear the accumulating buffer; keep the old snapshot live.
         with self.proxies_lock:
             self.proxies_new = []
             self.checking = True
@@ -1627,12 +2407,14 @@ class App:
         self.worker_thread.start()
 
     def stop(self):
+        """Request a stop for the running check."""
         if self.worker_thread and self.worker_thread.is_alive():
             self.stop_event.set()
             self._log(tr("log_stopping"))
             self.status_var.set(tr("log_stopped"))
 
     def _run_async(self, cfg):
+        """Worker entry point: run the pipeline in a fresh event loop."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -1648,7 +2430,7 @@ class App:
             self.root.after(0, self._on_finished)
 
     def _on_finished(self):
-        # Swap: new becomes old. Endpoints will now serve the fresh results.
+        """Swap new snapshot into old and re-enable UI."""
         with self.proxies_lock:
             self.proxies_old = list(self.proxies_new)
             self.proxies_new = []
@@ -1664,6 +2446,7 @@ class App:
         self.root.title(f"{tr('title')} — {self.ok_count}/{self.total_count}")
 
     async def _pipeline(self, cfg):
+        """Collect → check → save pipeline."""
         proxies = await collect_proxies(cfg["sources"], self._log)
         self.total_count = len(proxies)
         self._log(tr("log_proxies", n=len(proxies)))
@@ -1694,6 +2477,7 @@ class App:
 
     # ---------- Saving ----------
     def _save_all(self, results, cfg):
+        """Write JSON + by_country + by_param outputs to disk."""
         out = cfg["output"]
         base = out["dir"]
         os.makedirs(base, exist_ok=True)
@@ -1735,6 +2519,7 @@ class App:
         self._log(f"[+] By param: {by_param_dir}")
 
     def export_txt(self):
+        """Export current results (working proxies only) to a TXT file."""
         if not self.results:
             messagebox.showinfo(tr("title"), tr("no_results"))
             return

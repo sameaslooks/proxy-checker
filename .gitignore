@@ -184,3 +184,4 @@ cython_debug/
 # Custom
 output/
 proxy_checker_config.yaml
+facade_state.json
