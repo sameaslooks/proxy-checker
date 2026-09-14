@@ -866,17 +866,20 @@ def make_http_app(app: "App") -> aioweb.Application:
 
     @routes.get("/pac")
     async def pac(req):
-        # For browsers: sort by latency, not speed
-        data = _filter(req, force_sort="latency")
+        # For browsers: sort by download speed, chain top-3 with DIRECT fallback
+        data = _filter(req, force_sort="speed")
         if not data:
             pac_text = "function FindProxyForURL(url, host) { return 'DIRECT'; }"
         else:
-            first = data[0]
-            scheme = {"http": "PROXY", "https": "HTTPS",
-                      "socks4": "SOCKS", "socks5": "SOCKS5"}.get(first.protocol, "PROXY")
+            schemes = {"http": "PROXY", "https": "HTTPS",
+                       "socks4": "SOCKS", "socks5": "SOCKS5"}
+            chain = "; ".join(
+                f"{schemes.get(r.protocol, 'PROXY')} {r.ip}:{r.port}"
+                for r in data[:3]
+            )
             pac_text = (
                 "function FindProxyForURL(url, host) {\n"
-                f"    return '{scheme} {first.ip}:{first.port}; DIRECT';\n"
+                f"    return '{chain}; DIRECT';\n"
                 "}\n"
             )
         return aioweb.Response(
