@@ -43,10 +43,7 @@ SOCKS5 endpoint with automatic rotation and failover.
 ```bash
 git clone https://github.com/sameaslooks/proxy-checker.git
 cd proxy-checker
-python -m venv .venv
-source .venv/bin/activate
 
-pip install -r requirements.txt
 chmod +x run.sh
 ./run.sh
 ```
@@ -55,9 +52,6 @@ chmod +x run.sh
 ```
 git clone https://github.com/sameaslooks/proxy-checker.git
 cd proxy-checker
-python -m venv .venv
-.venv\Scripts\activate
 
-pip install -r requirements.txt
 run.bat
 ```

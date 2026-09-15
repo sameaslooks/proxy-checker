@@ -30,7 +30,7 @@ from dataclasses import dataclass, asdict
 from tkinter import (
     Tk, Toplevel, Frame, Label, Entry, Listbox, Text, StringVar,
     IntVar, END, BOTH, LEFT, RIGHT, X, Y,
-    filedialog, messagebox, Scrollbar,
+    filedialog, messagebox, Scrollbar, Canvas,
 )
 from tkinter import ttk
 
@@ -57,6 +57,33 @@ CONFIG_FILE = "proxy_checker_config.yaml"
 FACADE_STATE_FILE = "facade_state.json"
 MAX_ROWS = 5000
 FLUSH_MS = 200
+
+# ---------------------------------------------------------------------------
+# ASN / PeeringDB
+# ---------------------------------------------------------------------------
+
+ASN_CACHE_FILE = "asn_cache.json"
+ASN_CACHE_TTL_DAYS = 30
+PEERINGDB_API = "https://www.peeringdb.com/api"
+PEERINGDB_RPS_DELAY = 3.0
+PEERINGDB_BATCH_SIZE = 150
+
+# PeeringDB info_type -> asn_type
+PEERINGDB_TYPE_MAP = {
+    "Content":                "hosting",
+    "NSP":                    "nsp",
+    "Enterprise":             "business",
+    "Educational/Research":   "education",
+    "Non-Profit":             "nonprofit",
+    "Network Services":       "nsp",
+    "Government":             "government",
+    "Route Server":           "infra",
+    "Route Collector":        "infra",
+}
+
+# ---------------------------------------------------------------------------
+# Other constants
+# ---------------------------------------------------------------------------
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -336,6 +363,14 @@ class ProxyResult:
     anonymity: str = ""
     error: str = ""
     source: str = ""
+    # --- ASN / PeeringDB ---
+    asn: int = 0
+    asn_name: str = ""
+    asn_type: str = ""
+    asn_country: str = ""
+    is_hosting: bool = False
+    is_proxy: bool = False
+    is_mobile: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +524,230 @@ def load_json_results(path: str):
         return []
 
 
+class ASNResolver:
+    """Caches ASN -> PeeringDB info. ip -> ASN comes from ip-api, not cached.
+
+    Cache file: asn_cache.json
+    TTL: ASN_CACHE_TTL_DAYS days
+    Throttle: PEERINGDB_RPS_DELAY seconds between PeeringDB requests
+    """
+
+    def __init__(self, log, ttl_days=ASN_CACHE_TTL_DAYS, ignore_cache=False):
+        self.log = log
+        self.ttl_sec = ttl_days * 86400
+        self.ignore_cache = ignore_cache
+        self._cache = {}          # asn:int -> dict with fields + fetched_at
+        self._lock = asyncio.Lock()
+        self._last_call = 0.0
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(ASN_CACHE_FILE):
+            return
+        try:
+            with open(ASN_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw = data.get("entries") or {}
+            self._cache = {int(k): v for k, v in raw.items()}
+            self.log(f"[*] ASN cache loaded: {len(self._cache)} entries")
+        except Exception as e:
+            self.log(f"[!] ASN cache load failed: {e}")
+
+    def _save(self):
+        tmp = ASN_CACHE_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"ttl_days": self.ttl_sec // 86400, "entries": self._cache},
+                    f, ensure_ascii=False, indent=2,
+                )
+            os.replace(tmp, ASN_CACHE_FILE)
+        except Exception as e:
+            self.log(f"[!] ASN cache save failed: {e}")
+
+    def _fresh(self, entry) -> bool:
+        if self.ignore_cache:
+            return False
+        ts = entry.get("fetched_at", 0)
+        return (time.time() - ts) < self.ttl_sec
+
+    async def _throttle(self):
+        async with self._lock:
+            now = time.time()
+            wait = PEERINGDB_RPS_DELAY - (now - self._last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call = time.time()
+
+    async def resolve(self, session, asn: int) -> dict:
+        """Return PeeringDB info dict for ASN. From cache or network."""
+        if not asn:
+            return {}
+        cached = self._cache.get(asn)
+        if cached and self._fresh(cached):
+            return cached
+        await self._throttle()
+        try:
+            async with session.get(
+                f"{PEERINGDB_API}/net",
+                params={"asn": asn},
+                timeout=aiohttp.ClientTimeout(total=15),
+                headers={"User-Agent": DEFAULT_UA},
+            ) as r:
+                data = await r.json(content_type=None)
+            rows = data.get("data") or []
+            if rows:
+                info = rows[0]
+                entry = {
+                    "info_type":  info.get("info_type", "") or "",
+                    "info_scope": info.get("info_scope", "") or "",
+                    "name":       info.get("name", "") or "",
+                    "country":    info.get("country", "") or "",
+                    "fetched_at": time.time(),
+                }
+            else:
+                # PeeringDB does not know this ASN — cache "empty" with TTL
+                # so we do not re-query it on every run.
+                entry = {
+                    "info_type": "", "info_scope": "",
+                    "name": "", "country": "",
+                    "fetched_at": time.time(),
+                    "not_found": True,
+                }
+            self._cache[asn] = entry
+            return entry
+        except Exception as e:
+            self.log(f"[!] PeeringDB ASN {asn}: {e}")
+            # Do not cache network errors — retry next time.
+            return {}
+
+    async def resolve_many(self, session, asns):
+        """Resolve a list of ASNs in batches. Returns dict {asn: info}.
+
+        Splits ASNs into chunks of PEERINGDB_BATCH_SIZE and queries
+        PeeringDB with asn__in=... for each chunk. Cached ASNs are skipped.
+        Handles 429/5xx without caching (retry next run).
+        """
+        result = {}
+        to_fetch = []
+        now = time.time()
+
+        # 1. Serve fresh entries from cache, collect the rest
+        for asn in asns:
+            if not asn:
+                continue
+            cached = self._cache.get(asn)
+            if cached and self._fresh(cached):
+                result[asn] = cached
+            else:
+                to_fetch.append(asn)
+
+        if not to_fetch:
+            return result
+
+        # 2. Batch fetch
+        batches = [to_fetch[i:i + PEERINGDB_BATCH_SIZE]
+                   for i in range(0, len(to_fetch), PEERINGDB_BATCH_SIZE)]
+
+        for bi, batch in enumerate(batches):
+            await self._throttle()
+            try:
+                params = {"asn__in": ",".join(str(a) for a in batch)}
+                async with session.get(
+                    f"{PEERINGDB_API}/net",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers={"User-Agent": DEFAULT_UA},
+                ) as r:
+                    if r.status == 429:
+                        self.log(f"[!] PeeringDB 429 (batch {bi + 1}/{len(batches)}, "
+                                 f"{len(batch)} ASNs) — skipping, retry next run")
+                        continue
+                    if r.status >= 500:
+                        self.log(f"[!] PeeringDB {r.status} (batch {bi + 1}/{len(batches)})")
+                        continue
+                    if r.status != 200:
+                        self.log(f"[!] PeeringDB HTTP {r.status} (batch {bi + 1})")
+                        continue
+                    data = await r.json(content_type=None)
+            except Exception as e:
+                self.log(f"[!] PeeringDB batch {bi + 1}/{len(batches)}: {e}")
+                continue
+
+            # 3. Map response rows back to ASNs
+            found = set()
+            for info in (data.get("data") or []):
+                a = info.get("asn")
+                if not a:
+                    continue
+                found.add(a)
+                entry = {
+                    "info_type":  info.get("info_type", "") or "",
+                    "info_scope": info.get("info_scope", "") or "",
+                    "name":       info.get("name", "") or "",
+                    "fetched_at": time.time(),
+                }
+                self._cache[a] = entry
+                result[a] = entry
+
+            # 4. ASNs missing from response -> real not_found (HTTP 200, empty)
+            for a in batch:
+                if a in found:
+                    continue
+                entry = {
+                    "info_type": "", "info_scope": "", "name": "",
+                    "fetched_at": time.time(),
+                    "not_found": True,
+                }
+                self._cache[a] = entry
+                result[a] = entry
+
+            self.log(f"[*] PeeringDB batch {bi + 1}/{len(batches)}: "
+                     f"{len(found)}/{len(batch)} found")
+
+        return result
+
+    def save(self):
+        self._save()
+
+
+def classify_asn_type(asn: int, asn_name: str,
+                      is_hosting: bool, is_proxy: bool, is_mobile: bool,
+                      pdb: dict) -> str:
+    """Priority: ip-api -> PeeringDB -> unknown."""
+    # 1. ip-api says it directly
+    if is_hosting:
+        return "hosting"
+    if is_proxy:
+        return "proxy"
+    if is_mobile:
+        return "mobile"
+
+    # 2. PeeringDB info_type
+    itype = (pdb.get("info_type") or "").strip()
+    scope = (pdb.get("info_scope") or "").strip()
+
+    if itype == "Cable/DSL/ISP":
+        return "isp"
+
+    mapped = PEERINGDB_TYPE_MAP.get(itype)
+    if mapped:
+        return mapped
+
+    # 3. Name-based heuristic — in case PeeringDB is silent and ip-api
+    #    did not set the hosting flag (happens with small hosters).
+    name_lower = (asn_name or pdb.get("name") or "").lower()
+    hosting_markers = (
+        "hosting", "cloud", "server", "vps", "datacenter", "data center",
+        "colo", "leaseweb", "hetzner", "ovh", "digitalocean", "amazon",
+        "google", "microsoft", "azure", "linode", "contabo", "vultr",
+        "cloudflare", "fastly", "akamai",
+    )
+    if any(m in name_lower for m in hosting_markers):
+        return "hosting"
+
+    return "unknown"
+
 # ---------------------------------------------------------------------------
 # Network operations
 # ---------------------------------------------------------------------------
@@ -545,19 +804,36 @@ async def get_my_ip(session, log):
 
 
 async def geo_lookup(session, ip):
+    """Возвращает (country, city, isp, asn, asn_name,
+                      is_hosting, is_proxy, is_mobile)."""
     try:
         async with session.get(
             f"http://ip-api.com/json/{ip}",
-            params={"fields": "status,country,city,isp,query"},
+            params={"fields": "status,country,city,isp,query,"
+                              "as,asname,hosting,proxy,mobile"},
             timeout=aiohttp.ClientTimeout(total=10),
             headers={"User-Agent": DEFAULT_UA},
         ) as r:
             data = await r.json(content_type=None)
             if data.get("status") == "success":
-                return data.get("country", ""), data.get("city", ""), data.get("isp", "")
+                asn = 0
+                as_field = data.get("as") or ""
+                m = re.match(r"AS(\d+)", as_field)
+                if m:
+                    asn = int(m.group(1))
+                return (
+                    data.get("country", "") or "",
+                    data.get("city", "") or "",
+                    data.get("isp", "") or "",
+                    asn,
+                    data.get("asname", "") or "",
+                    bool(data.get("hosting")),
+                    bool(data.get("proxy")),
+                    bool(data.get("mobile")),
+                )
     except Exception:
         pass
-    return "", "", ""
+    return "", "", "", 0, "", False, False, False
 
 
 async def detect_anonymity(session_plain, scheme, ip, port, headers_url, my_ip, timeout):
@@ -622,6 +898,15 @@ async def check_one(session_plain, scheme, ip, port, check_url, timeout, source)
             res.country = data.get("country", "") or res.country
             res.city = data.get("city", "") or res.city
             res.isp = data.get("isp", "") or res.isp
+            # ASN fields from ip-api (present only if fields=... asks for them)
+            as_field = data.get("as") or ""
+            m = re.match(r"AS(\d+)", as_field)
+            if m:
+                res.asn = int(m.group(1))
+            res.asn_name = data.get("asname", "") or ""
+            res.is_hosting = bool(data.get("hosting"))
+            res.is_proxy = bool(data.get("proxy"))
+            res.is_mobile = bool(data.get("mobile"))
         res.ok = True
     except Exception as e:
         res.error = str(e)[:160]
@@ -666,7 +951,8 @@ async def measure_speed(session_plain, scheme, ip, port, test_url, timeout, size
         return 0
 
 
-async def check_many(proxies, cfg, log, progress_cb, on_result, stop_event, on_speed=None):
+async def check_many(proxies, cfg, log, progress_cb, on_result, stop_event,
+                     on_speed=None, on_asn=None):
     check_url = cfg["check_url"]
     headers_url = cfg.get("headers_url", "http://httpbin.org/headers")
     timeout = cfg["timeout"]
@@ -679,6 +965,7 @@ async def check_many(proxies, cfg, log, progress_cb, on_result, stop_event, on_s
     speed_size_bytes = int(cfg.get("speed_size_kb", 200)) * 1024
     speed_url = cfg.get("speed_test_url",
                         "https://speed.cloudflare.com/__down?bytes=200000")
+    do_asn = cfg.get("asn_lookup", True)
 
     total = len(proxies)
     done = 0
@@ -705,9 +992,10 @@ async def check_many(proxies, cfg, log, progress_cb, on_result, stop_event, on_s
                 async with sem_enrich:
                     if not stop_event.is_set():
                         if do_geo and not r.country and r.exit_ip:
-                            r.country, r.city, r.isp = await geo_lookup(
-                                session_plain, r.exit_ip
-                            )
+                            (r.country, r.city, r.isp,
+                             r.asn, r.asn_name,
+                             r.is_hosting, r.is_proxy, r.is_mobile) = \
+                                await geo_lookup(session_plain, r.exit_ip)
                         if do_anon and not r.anonymity:
                             r.anonymity = await detect_anonymity(
                                 session_plain, r.protocol, r.ip, r.port,
@@ -738,6 +1026,41 @@ async def check_many(proxies, cfg, log, progress_cb, on_result, stop_event, on_s
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        # --- ASN enrichment: PeeringDB lookup for unique ASNs (batched) ---
+        if do_asn and ok_results and not stop_event.is_set():
+            unique_asns = sorted({r.asn for r in ok_results if r.asn})
+            log(f"[*] ASN lookup: {len(unique_asns)} unique ASN(s) "
+                f"from {len(ok_results)} alive")
+            resolver = ASNResolver(
+                log,
+                ttl_days=int(cfg.get("asn_ttl_days", ASN_CACHE_TTL_DAYS)),
+                ignore_cache=bool(cfg.get("asn_ignore_cache", False)),
+            )
+            pdb_by_asn = await resolver.resolve_many(session_plain, unique_asns)
+            resolver.save()
+
+            for r in ok_results:
+                pdb = pdb_by_asn.get(r.asn, {})
+                r.asn_type = classify_asn_type(
+                    r.asn, r.asn_name,
+                    r.is_hosting, r.is_proxy, r.is_mobile,
+                    pdb,
+                )
+                if not r.asn_name and pdb.get("name"):
+                    r.asn_name = pdb["name"]
+                if not r.asn_country and pdb.get("country"):
+                    r.asn_country = pdb["country"]
+                if on_asn:
+                    on_asn(r)
+
+            # Summary log
+            type_counts = {}
+            for r in ok_results:
+                type_counts[r.asn_type] = type_counts.get(r.asn_type, 0) + 1
+            summary = ", ".join(f"{k}={v}" for k, v in
+                                sorted(type_counts.items(), key=lambda x: -x[1]))
+            log(f"[+] ASN enrichment done: {summary}")
 
         if do_speed and ok_results and not stop_event.is_set():
             log(tr("log_speed_start",
@@ -782,6 +1105,7 @@ def make_http_app(app: "App") -> aioweb.Application:
     def _filter(req, force_sort=None, force_min_speed=None):
         country = req.query.get("country", "").upper()
         anon = req.query.get("anon", "").lower()
+        asn_type = req.query.get("asn_type", "").lower()
         proto = req.query.get("proto", "").lower()
         try:
             limit = int(req.query.get("limit", "0") or 0)
@@ -808,6 +1132,8 @@ def make_http_app(app: "App") -> aioweb.Application:
             data = [r for r in data if (r.anonymity or "").lower() == anon]
         if proto:
             data = [r for r in data if r.protocol == proto]
+        if asn_type:
+            data = [r for r in data if (r.asn_type or "").lower() == asn_type]
         if only_elite:
             data = [r for r in data if r.anonymity == "elite"]
         if min_speed > 0:
@@ -915,6 +1241,54 @@ def make_http_app(app: "App") -> aioweb.Application:
             text=pac_text,
             content_type="application/x-ns-proxy-autoconfig",
         )
+
+    @routes.get("/asn_type/{t}")
+    async def asn_type_txt(t, req):
+        data = [r for r in _filter(req) if (r.asn_type or "").lower() == t.lower()]
+        body = "\n".join(f"{r.protocol}://{r.ip}:{r.port}" for r in data)
+        return aioweb.Response(text=body, content_type="text/plain")
+
+    @routes.get("/asn_type/{t}.json")
+    async def asn_type_json(t, req):
+        # aiohttp routes "{t}" greedily; strip the .json suffix if present
+        t = t[:-5] if t.endswith(".json") else t
+        data = [r for r in _filter(req) if (r.asn_type or "").lower() == t.lower()]
+        return aioweb.json_response([asdict(r) for r in data])
+
+    @routes.get("/hosting")
+    async def hosting(req):
+        data = [r for r in _filter(req) if r.asn_type == "hosting"]
+        body = "\n".join(f"{r.protocol}://{r.ip}:{r.port}" for r in data)
+        return aioweb.Response(text=body, content_type="text/plain")
+
+    @routes.get("/isp")
+    async def isp_endpoint(req):
+        data = [r for r in _filter(req) if r.asn_type == "isp"]
+        body = "\n".join(f"{r.protocol}://{r.ip}:{r.port}" for r in data)
+        return aioweb.Response(text=body, content_type="text/plain")
+
+    @routes.get("/mobile")
+    async def mobile(req):
+        data = [r for r in _filter(req) if r.asn_type == "mobile"]
+        body = "\n".join(f"{r.protocol}://{r.ip}:{r.port}" for r in data)
+        return aioweb.Response(text=body, content_type="text/plain")
+
+    @routes.get("/asn/stats")
+    async def asn_stats(req):
+        data = _current_data()
+        by_type = {}
+        by_asn = {}
+        for r in data:
+            t = r.asn_type or "unknown"
+            by_type[t] = by_type.get(t, 0) + 1
+            if r.asn:
+                key = f"AS{r.asn} {r.asn_name}".strip()
+                by_asn[key] = by_asn.get(key, 0) + 1
+        top_asn = sorted(by_asn.items(), key=lambda x: -x[1])[:50]
+        return aioweb.json_response({
+            "by_type": by_type,
+            "by_asn": dict(top_asn),
+        })
 
     webapp = aioweb.Application()
     webapp.add_routes(routes)
@@ -1645,8 +2019,48 @@ class App:
 
     # ---------- UI ----------
     def _build_ui(self):
-        # Sources
-        f_src = ttk.LabelFrame(self.root, text=tr("sources"))
+        # --- Scrollable container ---
+        self.scroll_canvas = Canvas(self.root, highlightthickness=0)
+        self.scroll_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
+        self.scroll_bar = Scrollbar(self.root, orient="vertical",
+                                    command=self.scroll_canvas.yview)
+        self.scroll_bar.pack(side=RIGHT, fill=Y)
+        self.scroll_canvas.configure(yscrollcommand=self.scroll_bar.set)
+
+        # Inner frame — all UI goes here
+        self.inner = Frame(self.scroll_canvas)
+        self.inner_id = self.scroll_canvas.create_window(
+            (0, 0), window=self.inner, anchor="nw"
+        )
+
+        # Update scrollregion when content size changes
+        def _on_inner_config(event):
+            self.scroll_canvas.configure(
+                scrollregion=self.scroll_canvas.bbox("all")
+            )
+        self.inner.bind("<Configure>", _on_inner_config)
+
+        # Make inner frame stretch to canvas width
+        def _on_canvas_config(event):
+            self.scroll_canvas.itemconfig(self.inner_id, width=event.width)
+        self.scroll_canvas.bind("<Configure>", _on_canvas_config)
+
+        # Mouse wheel scrolling
+        def _on_mousewheel(event):
+            self.scroll_canvas.yview_scroll(
+                int(-1 * (event.delta / 120)), "units"
+            )
+        # Windows / macOS
+        self.scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # Linux
+        self.scroll_canvas.bind_all("<Button-4>",
+                                    lambda e: self.scroll_canvas.yview_scroll(-3, "units"))
+        self.scroll_canvas.bind_all("<Button-5>",
+                                    lambda e: self.scroll_canvas.yview_scroll(3, "units"))
+
+        # --- Sources ---
+        f_src = ttk.LabelFrame(self.inner, text=tr("sources"))
         f_src.pack(fill=X, padx=8, pady=4)
 
         self.src_listbox = Listbox(f_src, height=4)
@@ -1662,12 +2076,15 @@ class App:
         ttk.Button(f_src_btns, text=tr("from_file"), command=self.add_sources_from_file).pack(fill=X, pady=2)
 
         # Check params
-        f_par = ttk.LabelFrame(self.root, text=tr("params"))
+        f_par = ttk.LabelFrame(self.inner, text=tr("params"))
         f_par.pack(fill=X, padx=8, pady=4)
 
         row = Frame(f_par); row.pack(fill=X, padx=4, pady=2)
         Label(row, text=tr("check_url")).pack(side=LEFT)
-        self.check_url = StringVar(value="http://ip-api.com/json?fields=status,country,city,isp,query")
+        self.check_url = StringVar(value=(
+            "http://ip-api.com/json?fields=status,country,city,isp,"
+            "query,as,asname,hosting,proxy,mobile"
+        ))
         Entry(row, textvariable=self.check_url).pack(side=LEFT, fill=X, expand=True, padx=4)
 
         row = Frame(f_par); row.pack(fill=X, padx=4, pady=2)
@@ -1687,8 +2104,18 @@ class App:
         self.anon_var = IntVar(value=1)
         ttk.Checkbutton(row, text=tr("detect_anon"), variable=self.anon_var).pack(side=LEFT, padx=6)
 
+        row = Frame(f_par); row.pack(fill=X, padx=4, pady=2)
+        self.asn_var = IntVar(value=1)
+        ttk.Checkbutton(row, text="ASN lookup (PeeringDB)",
+                        variable=self.asn_var).pack(side=LEFT)
+        self.asn_ignore_cache = IntVar(value=0)
+        ttk.Checkbutton(row, text="Ignore ASN cache",
+                        variable=self.asn_ignore_cache).pack(side=LEFT, padx=12)
+        ttk.Button(row, text="Clear ASN cache",
+                   command=self.clear_asn_cache).pack(side=LEFT, padx=8)
+
         # Speed test
-        f_speed = ttk.LabelFrame(self.root, text=tr("speed_group"))
+        f_speed = ttk.LabelFrame(self.inner, text=tr("speed_group"))
         f_speed.pack(fill=X, padx=8, pady=4)
 
         row = Frame(f_speed); row.pack(fill=X, padx=4, pady=2)
@@ -1705,7 +2132,7 @@ class App:
         Entry(row, textvariable=self.speed_test_url).pack(side=LEFT, fill=X, expand=True, padx=4)
 
         # Grouping
-        f_grp = ttk.LabelFrame(self.root, text=tr("grouping"))
+        f_grp = ttk.LabelFrame(self.inner, text=tr("grouping"))
         f_grp.pack(fill=X, padx=8, pady=4)
         self.group_vars = {
             "country": IntVar(value=1),
@@ -1717,7 +2144,7 @@ class App:
             ttk.Checkbutton(f_grp, text=k, variable=v).pack(side=LEFT, padx=8, pady=4)
 
         # Output
-        f_out = ttk.LabelFrame(self.root, text=tr("output"))
+        f_out = ttk.LabelFrame(self.inner, text=tr("output"))
         f_out.pack(fill=X, padx=8, pady=4)
 
         row = Frame(f_out); row.pack(fill=X, padx=4, pady=2)
@@ -1738,7 +2165,7 @@ class App:
         Entry(row, textvariable=self.out_param, width=15).pack(side=LEFT, padx=4)
 
         # HTTP server
-        f_http = ttk.LabelFrame(self.root, text=tr("http_group"))
+        f_http = ttk.LabelFrame(self.inner, text=tr("http_group"))
         f_http.pack(fill=X, padx=8, pady=4)
 
         row = Frame(f_http); row.pack(fill=X, padx=4, pady=2)
@@ -1752,21 +2179,52 @@ class App:
         ttk.Checkbutton(row, text=tr("autostart"),
                         variable=self.auto_http).pack(side=LEFT, padx=12)
 
-        row = Frame(f_http); row.pack(fill=X, padx=4, pady=2)
-        Label(row, text=tr("examples")).pack(side=LEFT)
-        for txt in (
-            "/best?country=DE&limit=10",
-            "/fast?min_speed=500&limit=10",
-            "/fast?country=DE",
-            "/proxies?min_speed=500&sort=speed",
-            "/random?country=FR",
-            "/pac?country=DE",
-            "/stats",
-        ):
-            Label(row, text=txt, fg="gray").pack(side=LEFT, padx=4)
+        # Endpoint hints (separate block, two columns)
+        f_hints = ttk.LabelFrame(self.inner, text="HTTP API examples")
+        f_hints.pack(fill=X, padx=8, pady=4)
+
+        endpoints = [
+            # (label, description)
+            ("/stats",                          "summary: totals, by country/anon/proto"),
+            ("/asn/stats",                      "summary: by asn_type, top ASN"),
+            ("/proxies",                        "all proxies, plain text"),
+            ("/proxies.json",                   "all proxies, JSON"),
+            ("/best",                           "sorted by speed"),
+            ("/fast",                           "speed > 0, sorted"),
+            ("/random",                         "one random proxy"),
+            ("/pac",                            "PAC file for browsers"),
+            ("/hosting",                        "only hosting (DC/cloud)"),
+            ("/isp",                            "only ISP (residential + regional)"),
+            ("/mobile",                         "only mobile carriers"),
+            ("/asn_type/<t>",                   "generic: any asn_type"),
+            ("/asn_type/<t>.json",              "same, JSON"),
+        ]
+
+        # Filters hint
+        Label(f_hints, text="Filters (append to any endpoint):",
+              fg="gray").grid(row=0, column=0, columnspan=2,
+                              sticky="w", padx=4, pady=(2, 0))
+        Label(f_hints,
+              text="?country=DE  ?asn_type=hosting  ?anon=elite  "
+                   "?proto=socks5  ?min_speed=500  ?max_latency=2000  "
+                   "?limit=10  ?sort=speed|latency|random",
+              fg="gray").grid(row=1, column=0, columnspan=2,
+                              sticky="w", padx=4, pady=(0, 4))
+
+        # Endpoint list: two columns
+        Label(f_hints, text="Endpoints:", fg="gray").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+
+        for i, (ep, desc) in enumerate(endpoints):
+            r = 3 + i // 2
+            c = (i % 2) * 2
+            Label(f_hints, text=ep, fg="black", font=("Consolas", 9)).grid(
+                row=r, column=c, sticky="w", padx=(8, 4), pady=1)
+            Label(f_hints, text=desc, fg="gray").grid(
+                row=r, column=c + 1, sticky="w", padx=(0, 20), pady=1)
 
         # Facade
-        f_fac = ttk.LabelFrame(self.root, text=tr("facade_group"))
+        f_fac = ttk.LabelFrame(self.inner, text=tr("facade_group"))
         f_fac.pack(fill=X, padx=8, pady=4)
 
         row = Frame(f_fac); row.pack(fill=X, padx=4, pady=2)
@@ -1797,7 +2255,7 @@ class App:
         Label(row, text=tr("facade_auth_hint"), fg="gray").pack(side=LEFT, padx=8)
 
         # Auto + tray
-        f_auto = ttk.LabelFrame(self.root, text=tr("auto_group"))
+        f_auto = ttk.LabelFrame(self.inner, text=tr("auto_group"))
         f_auto.pack(fill=X, padx=8, pady=4)
 
         row = Frame(f_auto); row.pack(fill=X, padx=4, pady=2)
@@ -1821,7 +2279,7 @@ class App:
                         variable=self.autostart_check).pack(side=LEFT)
 
         # Buttons
-        f_run = Frame(self.root)
+        f_run = Frame(self.inner)
         f_run.pack(fill=X, padx=8, pady=6)
         ttk.Button(f_run, text=tr("save_cfg"), command=self.save_cfg_from_ui).pack(side=LEFT, padx=2)
         ttk.Button(f_run, text=tr("load_cfg"), command=self.load_cfg_into_ui).pack(side=LEFT, padx=2)
@@ -1837,23 +2295,24 @@ class App:
         self.progress.pack(side=LEFT, fill=X, expand=True, padx=8)
 
         self.status_var = StringVar(value=tr("ready"))
-        Label(self.root, textvariable=self.status_var, anchor="w").pack(fill=X, padx=10)
+        Label(self.inner, textvariable=self.status_var, anchor="w").pack(fill=X, padx=10)
 
         # Log
-        f_log = ttk.LabelFrame(self.root, text="Log")
+        f_log = ttk.LabelFrame(self.inner, text="Log")
         f_log.pack(fill=BOTH, expand=True, padx=8, pady=4)
-        self.log = Text(f_log, height=6, wrap="none")
+        self.log = Text(f_log, height=10, wrap="none")
         self.log.pack(side=LEFT, fill=BOTH, expand=True, padx=4, pady=4)
         sb2 = Scrollbar(f_log, command=self.log.yview)
         sb2.pack(side=LEFT, fill=Y)
         self.log.config(yscrollcommand=sb2.set)
 
         # Results
-        f_res = ttk.LabelFrame(self.root, text="Proxies")
+        f_res = ttk.LabelFrame(self.inner, text="Proxies")
         f_res.pack(fill=BOTH, expand=True, padx=8, pady=4)
         cols = ("raw", "protocol", "latency_ms", "speed_kbps", "exit_ip",
-                "country", "city", "isp", "anonymity", "source")
-        self.tree = ttk.Treeview(f_res, columns=cols, show="headings", height=8)
+                "country", "city", "isp", "anonymity", "asn_type",
+                "asn_name", "source")
+        self.tree = ttk.Treeview(f_res, columns=cols, show="headings", height=12)
         for c in cols:
             self.tree.heading(c, text=c, command=lambda col=c: self._sort_by_column(col))
             self.tree.column(c, width=100, anchor="w")
@@ -1904,7 +2363,13 @@ class App:
         c = self.cfg
         for u in c.get("sources", []):
             self.src_listbox.insert(END, u)
-        if "check_url" in c: self.check_url.set(c["check_url"])
+        if "check_url" in c:
+            self.check_url.set(c["check_url"])
+        else:
+            self.check_url.set(
+                "http://ip-api.com/json?fields=status,country,city,isp,"
+                "query,as,asname,hosting,proxy,mobile"
+            )
         if "headers_url" in c: self.headers_url.set(c["headers_url"])
         if "concurrency" in c: self.concurrency.set(c["concurrency"])
         if "timeout" in c: self.timeout.set(c["timeout"])
@@ -1928,6 +2393,8 @@ class App:
         if "auto_interval" in c: self.auto_interval.set(c["auto_interval"])
         self.hide_on_close.set(1 if c.get("hide_on_close", True) else 0)
         self.autostart_check.set(1 if c.get("autostart_check", True) else 0)
+        self.asn_var.set(1 if c.get("asn_lookup", True) else 0)
+        self.asn_ignore_cache.set(1 if c.get("asn_ignore_cache", False) else 0)
         # Facade
         if "facade_host" in c: self.facade_host.set(c["facade_host"])
         if "facade_port" in c: self.facade_port.set(c["facade_port"])
@@ -1977,6 +2444,8 @@ class App:
                 "by_country_dir": self.out_country.get(),
                 "by_param_dir": self.out_param.get(),
             },
+            "asn_lookup": bool(self.asn_var.get()),
+            "asn_ignore_cache": bool(self.asn_ignore_cache.get()),
             # Facade
             "facade_host": self.facade_host.get(),
             "facade_port": int(self.facade_port.get()),
@@ -2017,6 +2486,16 @@ class App:
             self.proxies_new.append(r)
         self.root.after(0, self._update_title)
 
+    def _on_asn(self, r: ProxyResult):
+        """Update asn_type/asn_name cells after the PeeringDB phase."""
+        def upd():
+            key = (r.protocol, r.ip, r.port)
+            iid = self._iid_by_key.get(key)
+            if iid and self.tree.exists(iid):
+                self.tree.set(iid, "asn_type", r.asn_type or "")
+                self.tree.set(iid, "asn_name", r.asn_name or "")
+        self.root.after(0, upd)
+
     def _on_speed(self, r: ProxyResult, done: int, total: int):
         """Update speed cell for a proxy after speed test."""
         def upd():
@@ -2037,7 +2516,8 @@ class App:
             for r in self.row_buffer:
                 iid = self.tree.insert("", END, values=(
                     r.raw, r.protocol, r.latency_ms, r.speed_kbps, r.exit_ip,
-                    r.country, r.city, r.isp, r.anonymity, r.source,
+                    r.country, r.city, r.isp, r.anonymity,
+                    r.asn_type, r.asn_name, r.source,
                 ))
                 self._iid_by_key[(r.protocol, r.ip, r.port)] = iid
             self.row_buffer.clear()
@@ -2468,7 +2948,8 @@ class App:
             self._on_speed(r, done, total)
 
         results = await check_many(
-            proxies, cfg, self._log, progress, on_result, self.stop_event, on_speed
+            proxies, cfg, self._log, progress, on_result, self.stop_event,
+            on_speed, self._on_asn,
         )
         ok = [r for r in results if r.ok]
         self._log(tr("log_alive", ok=len(ok), total=len(results)))
@@ -2518,6 +2999,24 @@ class App:
                         f.write(f"{r.raw}\n")
         self._log(f"[+] By param: {by_param_dir}")
 
+        by_asn_type_dir = os.path.join(base, "by_asn_type")
+        os.makedirs(by_asn_type_dir, exist_ok=True)
+        bb = defaultdict(list)
+        for r in results:
+            if not r.ok:
+                continue
+            t = r.asn_type or "unknown"
+            country = r.country or "unknown"
+            bb[(t, country)].append(r)
+        for (t, country), items in bb.items():
+            safe_t = re.sub(r"[^\w\-.]", "_", t)
+            safe_c = re.sub(r"[^\w\-.]", "_", country)
+            p = os.path.join(by_asn_type_dir, f"{safe_t}__{safe_c}.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                for r in items:
+                    f.write(f"{r.raw}\n")
+        self._log(f"[+] By ASN type: {by_asn_type_dir}")
+
     def export_txt(self):
         """Export current results (working proxies only) to a TXT file."""
         if not self.results:
@@ -2532,6 +3031,15 @@ class App:
                     f.write(f"{r.raw}\n")
         self._log(tr("log_export", path=path))
 
+    def clear_asn_cache(self):
+        if os.path.exists(ASN_CACHE_FILE):
+            try:
+                os.remove(ASN_CACHE_FILE)
+                self._log(f"[*] ASN cache cleared: {ASN_CACHE_FILE}")
+            except Exception as e:
+                self._log(f"[!] Failed to clear ASN cache: {e}")
+        else:
+            self._log("[*] ASN cache already empty")
 
 def main():
     root = Tk()
