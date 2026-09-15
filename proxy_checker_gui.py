@@ -1317,13 +1317,14 @@ class _UpstreamRejected(Exception):
     """
 
 class FacadeUpstream:
-    __slots__ = ("raw", "protocol", "ip", "port")
+    __slots__ = ("raw", "protocol", "ip", "port", "exit_ip")
 
-    def __init__(self, raw, protocol, ip, port):
+    def __init__(self, raw, protocol, ip, port, exit_ip=""):
         self.raw = raw
         self.protocol = protocol
         self.ip = ip
         self.port = port
+        self.exit_ip = exit_ip
 
 
 async def _read_exact(reader, n):
@@ -1572,8 +1573,11 @@ class Socks5Facade:
         self._cooldowns = {}          # raw -> unix time until available again
         self._active_upstream = None  # currently used upstream
         self._active_since = 0.0      # unix time when active became active
+        self._history = collections.deque(maxlen=5)   # last N exit IPs
+        self._force_rotate = False                    # flag for manual rotate
         self.running = False
         self._state_dirty = False
+        self._client_tasks = set()
         self._load_state()
 
     def _load_state(self):
@@ -1599,7 +1603,6 @@ class Socks5Facade:
         active_raw = data.get("active_raw")
         active_since = data.get("active_since") or 0.0
         if active_raw and active_raw not in self._cooldowns:
-            # We do not know protocol/ip/port yet — parse from raw.
             m = re.match(r"^(socks5|socks4|https?|http)://([\d.]+):(\d+)$",
                          active_raw)
             if m:
@@ -1608,11 +1611,18 @@ class Socks5Facade:
                     protocol=m.group(1),
                     ip=m.group(2),
                     port=int(m.group(3)),
+                    exit_ip=data.get("active_exit_ip", "") or "",
                 )
                 try:
                     self._active_since = float(active_since)
                 except (TypeError, ValueError):
                     self._active_since = now
+        # Restore history
+        hist = data.get("history") or []
+        if isinstance(hist, list):
+            for item in hist[-5:]:
+                if isinstance(item, dict):
+                    self._history.append(item)
         n_cd = sum(1 for u in self._cooldowns.values() if u > now)
         if self._active_upstream:
             self.log(f"[*] Facade state restored: active={self._active_upstream.raw} "
@@ -1623,9 +1633,11 @@ class Socks5Facade:
         now = time.time()
         data = {
             "active_raw": self._active_upstream.raw if self._active_upstream else None,
+            "active_exit_ip": self._active_upstream.exit_ip if self._active_upstream else "",
             "active_since": self._active_since,
             "cooldowns": {raw: until for raw, until in self._cooldowns.items()
                           if until > now},
+            "history": list(self._history),
         }
         tmp = FACADE_STATE_FILE + ".tmp"
         try:
@@ -1652,16 +1664,21 @@ class Socks5Facade:
         rotation_enabled = bool(self.app.facade_rotation.get())
         interval = max(1, int(self.app.facade_interval.get()))
 
+        # Force rotation requested by user?
+        force = self._force_rotate
+        self._force_rotate = False
+
         # Active still usable?
-        if self._active_upstream is not None \
-                and self._active_upstream.raw not in exclude \
-                and self._cooldowns.get(self._active_upstream.raw, 0) <= now:
+        if (not force
+                and self._active_upstream is not None
+                and self._active_upstream.raw not in exclude):
             if not rotation_enabled:
                 return self._active_upstream
             if (now - self._active_since) < interval:
                 return self._active_upstream
 
-        # Pick the fastest available.
+        # Pick the next best available — skip the currently active one
+        # so that rotation actually changes the upstream.
         with self.app.proxies_lock:
             data = list(self.app.proxies_old)
         if not data:
@@ -1670,29 +1687,67 @@ class Socks5Facade:
             return None
         data.sort(key=lambda r: r.speed_kbps or 0, reverse=True)
 
+        active_raw = (self._active_upstream.raw
+                      if self._active_upstream else None)
+
         chosen = None
         for r in data:
             raw = f"{r.protocol}://{r.ip}:{r.port}"
             if raw in exclude:
                 continue
+            if raw == active_raw:
+                continue          # ← skip current active
             if self._cooldowns.get(raw, 0) > now:
                 continue
             chosen = FacadeUpstream(raw=raw, protocol=r.protocol,
-                                    ip=r.ip, port=r.port)
+                                    ip=r.ip, port=r.port,
+                                    exit_ip=r.exit_ip or "")
             break
+
+        # Fallback: if we skipped everything (only one proxy alive), reuse active
+        if chosen is None and self._active_upstream is not None:
+            if (self._active_upstream.raw not in exclude
+                    and self._cooldowns.get(self._active_upstream.raw, 0) <= now):
+                chosen = self._active_upstream
 
         if chosen is None:
             self._active_upstream = None
             self._save_state()
             return None
 
+        # Put the chosen upstream on cooldown so it is not picked again
+        # until the cooldown expires. This gives each proxy a rest period
+        # and prevents ping-ponging between the same two top upstreams.
+        cooldown_sec = int(self.app.facade_cooldown.get())
+        self._cooldowns[chosen.raw] = now + cooldown_sec
+
+        # Append to history if this is a real change
+        if (self._active_upstream is None
+                or self._active_upstream.raw != chosen.raw):
+            self._history.append({
+                "raw": chosen.raw,
+                "exit_ip": chosen.exit_ip or "",
+                "since": now,
+            })
         self._active_upstream = chosen
         self._active_since = now
+        self._force_rotate = False
         self._save_state()
         return chosen
 
     async def _handle(self, reader, writer):
         """Handle one client SOCKS5 session."""
+        task = asyncio.current_task()
+        if task:
+            self._client_tasks.add(task)
+        try:
+            await self._handle_inner(reader, writer)
+        finally:
+            if task:
+                self._client_tasks.discard(task)
+
+    async def _handle_inner(self, reader, writer):
+        """Actual handler body — separated so we can track the task."""
         peer = writer.get_extra_info("peername")
         client = f"{peer[0]}:{peer[1]}" if peer else "?"
         try:
@@ -1853,7 +1908,35 @@ class Socks5Facade:
             except Exception:
                 pass
             self.server = None
+        # Cancel all active client sessions so they don't outlive the loop
+        if self._client_tasks:
+            for t in list(self._client_tasks):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*self._client_tasks, return_exceptions=True)
+            self._client_tasks.clear()
         self.log(tr("facade_log_stop"))
+
+    def rotate_now(self):
+        """Force the next _pick() to select a new upstream."""
+        self._force_rotate = True
+        self.log("[*] Facade: manual rotation requested")
+
+    def get_status(self):
+        """Return current facade status: active upstream + history."""
+        active = None
+        if self._active_upstream:
+            active = {
+                "raw": self._active_upstream.raw,
+                "exit_ip": self._active_upstream.exit_ip or "",
+                "since": self._active_since,
+            }
+        return {
+            "active": active,
+            "history": list(self._history),
+            "cooldowns": dict(self._cooldowns),
+            "running": self.running,
+        }
 
 
 class FacadeThread(threading.Thread):
@@ -1997,6 +2080,7 @@ class App:
 
         self.root.after(100, self._drain_log)
         self.root.after(FLUSH_MS, self._flush_rows)
+        self.root.after(2000, self._refresh_facade_status)
 
         if self.auto_http.get():
             self.root.after(500, self._auto_start_http)
@@ -2234,10 +2318,23 @@ class App:
         Entry(row, textvariable=self.facade_port, width=6).pack(side=LEFT, padx=4)
         self.btn_facade = ttk.Button(row, text=tr("facade_start"), command=self.toggle_facade)
         self.btn_facade.pack(side=LEFT, padx=12)
+        self.btn_rotate = ttk.Button(row, text="Rotate now",
+                                     command=self.rotate_facade_now)
+        self.btn_rotate.pack(side=LEFT, padx=4)
         self.facade_status = StringVar(value=tr("facade_stopped"))
         Label(row, textvariable=self.facade_status).pack(side=LEFT, padx=8)
         ttk.Checkbutton(row, text=tr("autostart"),
                         variable=self.facade_autostart).pack(side=LEFT, padx=12)
+
+        row = Frame(f_fac); row.pack(fill=X, padx=4, pady=2)
+        Label(row, text="Current exit IP:").pack(side=LEFT)
+        self.facade_exit_ip = StringVar(value="—")
+        Label(row, textvariable=self.facade_exit_ip,
+              font=("Consolas", 10), fg="green").pack(side=LEFT, padx=8)
+        Label(row, text="History:").pack(side=LEFT, padx=(20, 4))
+        self.facade_history = StringVar(value="—")
+        Label(row, textvariable=self.facade_history,
+              font=("Consolas", 9), fg="gray").pack(side=LEFT)
 
         row = Frame(f_fac); row.pack(fill=X, padx=4, pady=2)
         ttk.Checkbutton(row, text=tr("facade_rotation"),
@@ -2716,6 +2813,45 @@ class App:
         self.facade_running = False
         self.btn_facade.config(text=tr("facade_start"))
         self.facade_status.set(tr("facade_stopped"))
+
+    def rotate_facade_now(self):
+        """Request immediate upstream rotation for the facade."""
+        if not self.facade_running or not self.facade_thread:
+            self._log("[*] Rotate: facade is not running")
+            return
+        try:
+            facade = self.facade_thread.facade
+            if facade:
+                loop = self.facade_thread.loop
+                loop.call_soon_threadsafe(facade.rotate_now)
+                self._log("[*] Rotate: requested")
+        except Exception as e:
+            self._log(f"[!] Rotate failed: {e}")
+
+    def _refresh_facade_status(self):
+        """Poll facade status and update UI labels."""
+        if not self.facade_running or not self.facade_thread:
+            self.facade_exit_ip.set("—")
+            self.facade_history.set("—")
+        else:
+            facade = self.facade_thread.facade
+            if facade:
+                try:
+                    st = facade.get_status()
+                    active = st.get("active") or {}
+                    exit_ip = active.get("exit_ip") or "?"
+                    raw = active.get("raw") or "?"
+                    self.facade_exit_ip.set(f"{exit_ip}  ({raw})")
+                    hist = st.get("history") or []
+                    # Show last 5 exit IPs, most recent first
+                    parts = []
+                    for item in reversed(hist[-5:]):
+                        ip = item.get("exit_ip") or "?"
+                        parts.append(ip)
+                    self.facade_history.set(" → ".join(parts) if parts else "—")
+                except Exception:
+                    pass
+        self.root.after(2000, self._refresh_facade_status)
 
     # ---------- Tray ----------
     def _make_tray_image(self):

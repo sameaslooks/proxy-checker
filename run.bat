@@ -2,8 +2,6 @@
 setlocal
 cd /d "%~dp0"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run.ps1"
-
 if not exist ".venv\Scripts\python.exe" (
     echo [*] Creating virtual environment...
     python -m venv .venv
