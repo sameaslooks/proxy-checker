@@ -1578,6 +1578,7 @@ class Socks5Facade:
         self.running = False
         self._state_dirty = False
         self._client_tasks = set()
+        self._pipe_tasks = set()
         self._load_state()
 
     def _load_state(self):
@@ -1703,6 +1704,21 @@ class Socks5Facade:
                                     ip=r.ip, port=r.port,
                                     exit_ip=r.exit_ip or "")
             break
+
+        # Forced rotation ignores cooldowns — otherwise if the whole pool is
+        # in cooldown, Rotate now silently returns the same upstream.
+        if force and chosen is None:
+            for r in data:
+                raw = f"{r.protocol}://{r.ip}:{r.port}"
+                if raw in exclude:
+                    continue
+                if raw == active_raw:
+                    continue
+                chosen = FacadeUpstream(raw=raw, protocol=r.protocol,
+                                        ip=r.ip, port=r.port,
+                                        exit_ip=r.exit_ip or "")
+                self.log(f"[*] Facade: forced rotation ignoring cooldown → {raw}")
+                break
 
         # Fallback: if we skipped everything (only one proxy alive), reuse active
         if chosen is None and self._active_upstream is not None:
@@ -1846,12 +1862,16 @@ class Socks5Facade:
             # Pipe both directions; exit when either side closes.
             t1 = asyncio.create_task(_pipe(reader, uw))
             t2 = asyncio.create_task(_pipe(ur, writer))
+            self._pipe_tasks.add(t1)
+            self._pipe_tasks.add(t2)
             try:
                 await asyncio.wait({t1, t2},
-                                   return_when=asyncio.FIRST_COMPLETED)
+                                return_when=asyncio.FIRST_COMPLETED)
             except Exception:
                 pass
             finally:
+                self._pipe_tasks.discard(t1)
+                self._pipe_tasks.discard(t2)
                 for t in (t1, t2):
                     if not t.done():
                         t.cancel()
@@ -1918,9 +1938,18 @@ class Socks5Facade:
         self.log(tr("facade_log_stop"))
 
     def rotate_now(self):
-        """Force the next _pick() to select a new upstream."""
+        """Force immediate rotation: kill all active pipes + flag next pick."""
         self._force_rotate = True
-        self.log("[*] Facade: manual rotation requested")
+        killed = 0
+        for t in list(self._pipe_tasks):
+            if not t.done():
+                t.cancel()
+                killed += 1
+        if killed:
+            self.log(f"[*] Facade: manual rotation — dropped {killed} active pipe(s)")
+        else:
+            self.log("[*] Facade: manual rotation — no active pipes, "
+                    "will apply on next connect")
 
     def get_status(self):
         """Return current facade status: active upstream + history."""
